@@ -3,8 +3,7 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::fmt::Debug;
 
 use crate::{
-    api::{Api, Patch, PatchParams, PostParams},
-    Error, Result,
+    api::{Api, Patch, PatchParams, PostParams}, Error, Result
 };
 
 use kube_core::response::Status;
@@ -18,6 +17,8 @@ pub use k8s_openapi::api::autoscaling::v1::{Scale, ScaleSpec, ScaleStatus};
 
 #[cfg(feature = "ws")] use crate::api::portforward::Portforwarder;
 #[cfg(feature = "ws")] use crate::api::remote_command::AttachedProcess;
+
+use super::Proxier;
 
 /// Methods for [scale subresource](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#scale-subresource).
 impl<K> Api<K>
@@ -608,5 +609,111 @@ where
             .map_err(Error::BuildRequest)?;
         let stream = self.client.connect(req).await?;
         Ok(Portforwarder::new(stream, ports))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Proxy subresource
+// ----------------------------------------------------------------------------
+#[test]
+fn proxy_path() {
+    use crate::api::{Request, Resource};
+    use k8s_openapi::api::core::v1 as corev1;
+    let url = corev1::Service::url_path(&(), Some("ns"));
+
+    let req = http::Request::get("http://fake.io").body::<Vec<u8>>(vec![]).unwrap();
+    let req = Request::new(&url).proxy("foo", None, req).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/services/foo/proxy/"
+    );
+
+    let req = http::Request::get("http://fake.io/the/path").body::<Vec<u8>>(vec![]).unwrap();
+    let req = Request::new(&url).proxy("foo", None, req).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/services/foo/proxy/the/path"
+    );
+
+    let req = http::Request::get("http://fake.io/the/path?and=query").body::<Vec<u8>>(vec![]).unwrap();
+    let req = Request::new(&url).proxy("foo", None, req).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/services/foo/proxy/the/path?and=query"
+    );
+}
+
+#[test]
+fn proxy_path_port() {
+    use crate::api::{Request, Resource};
+    use k8s_openapi::api::core::v1 as corev1;
+
+    let req = http::Request::get("http://fake.io/the/path?and=query").body::<Vec<u8>>(vec![]).unwrap();
+
+    let url = corev1::Service::url_path(&(), Some("ns"));
+    let req = Request::new(url).proxy("foo", Some("http"), req).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/services/foo:http/proxy/the/path?and=query"
+    );
+}
+
+#[test]
+fn proxy_path_https() {
+    use crate::api::{Request, Resource};
+    use k8s_openapi::api::core::v1 as corev1;
+
+    let req = http::Request::get("https://fake.io/the/path?and=query").body::<Vec<u8>>(vec![]).unwrap();
+
+    let url = corev1::Service::url_path(&(), Some("ns"));
+    let req = Request::new(url).proxy("foo", None, req).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/services/https:foo:/proxy/the/path?and=query"
+    );
+}
+
+#[test]
+fn proxy_path_port_https() {
+    use crate::api::{Request, Resource};
+    use k8s_openapi::api::core::v1 as corev1;
+
+    let req = http::Request::get("https://fake.io/the/path?and=query").body::<Vec<u8>>(vec![]).unwrap();
+
+    let url = corev1::Service::url_path(&(), Some("ns"));
+    let req = Request::new(url).proxy("foo",Some("443"), req).unwrap();
+    assert_eq!(
+        req.uri(),
+        "/api/v1/namespaces/ns/services/https:foo:443/proxy/the/path?and=query"
+    );
+}
+
+/// Marker trait for objects that have the proxy subresource
+///
+/// See [`Api::proxy`] and [`Api::proxied`] for usage.
+pub trait Proxy {}
+
+impl Proxy for k8s_openapi::api::core::v1::Pod {}
+impl Proxy for k8s_openapi::api::core::v1::Service {}
+impl Proxy for k8s_openapi::api::core::v1::Node {}
+
+impl<K> Api<K>
+where
+    K: Clone + Proxy,
+{
+    /// Create a [`Proxier`] for this resource, which is a [`tower::Service`] that
+    /// prepends all requests with the proxy URL of the resource and sends them
+    /// using [`crate::Client`].
+    pub fn proxy(&self, name: &str, port: Option<&str>) -> Proxier<K> {
+        Proxier::new(self.clone(), name, port)
+    }
+
+    /// Modify a [`http::Request`] such that it will be proxied through the proxy URL
+    /// of this resource
+    pub fn proxied<B>(&self, name: &str, port: Option<&str>, req: http::Request<B>) -> Result<http::Request<B>> {
+         self
+            .request
+            .proxy(name, port, req)
+            .map_err(Error::BuildRequest)
     }
 }

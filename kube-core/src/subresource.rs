@@ -6,6 +6,7 @@ use crate::{
     request::{Error, Request, JSON_MIME},
 };
 
+use http::{uri::Scheme, Method, Uri};
 pub use k8s_openapi::api::autoscaling::v1::{Scale, ScaleSpec, ScaleStatus};
 
 // ----------------------------------------------------------------------------
@@ -451,5 +452,47 @@ impl Request {
 
         let req = http::Request::get(qp.finish());
         req.body(vec![]).map_err(Error::BuildRequest)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Proxy subresource
+// ----------------------------------------------------------------------------
+impl Request {
+    /// Proxy a request to a pod/node
+    pub fn proxy<B>(
+        &self,
+        name: &str,
+        port: Option<&str>,
+        mut req: http::Request<B>,
+    ) -> Result<http::Request<B>, Error> {
+        if !matches!(
+            *req.method(),
+            Method::GET | Method::POST | Method::PUT | Method::HEAD | Method::DELETE
+        ) {
+            return Err(Error::Validation(format!(
+                "HTTP method {} is not supported for proxy requests",
+                req.method()
+            )));
+        }
+
+        let port = port.unwrap_or_default();
+
+        let name = if req.uri().scheme() == Some(&Scheme::HTTPS) {
+            format!("https:{name}:{port}")
+        } else if !port.is_empty() {
+            format!("{name}:{port}")
+        } else {
+            name.to_string()
+        };
+
+        let mut uri = format!("{}/{}/proxy", self.url_path, name);
+        if let Some(pq) = req.uri().path_and_query() {
+            uri += pq.as_str();
+        }
+
+        *req.uri_mut() = uri.parse::<Uri>().map_err(|e| Error::BuildRequest(e.into()))?;
+
+        Ok(req)
     }
 }
